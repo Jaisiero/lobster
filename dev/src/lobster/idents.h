@@ -193,11 +193,12 @@ struct DispatchEntry {
     SubFunction *sf = nullptr;          // if !is_switch_dispatch
     int case_index = -1;                // if is_switch_dispatch
     bool is_switch_dispatch = false;
-    bool is_dispatch_root = false;
+    UDT *dispatch_root = nullptr;
     // Shared return type if root of dispatch.
     TypeRef returntype = nullptr;
     int returned_thru_to_max = -1;
     size_t subudts_size = 0;  // At time of creation.
+    int vtable_idx = -1;
 };
 
 // This contains the declaration-side stuff for any UDT, and may contain
@@ -261,7 +262,7 @@ struct UDT : Named {
     // Multiple specializations of a method may be in here.
     // Methods whose dispatch can be determined statically for the current program do not end up
     // in here.
-    vector<DispatchEntry> dispatch_table;
+    vector<unique_ptr<DispatchEntry>> dispatch_table;
 
     UDT(string_view _name, int _idx, GUDT &g) : Named(_name, _idx), g(g) {
         thistype = g.is_struct ? Type { V_STRUCT_R, this } : Type { V_CLASS, this };
@@ -395,6 +396,11 @@ struct Arg {
 struct Function;
 struct SubFunction;
 
+struct Caller {
+    SubFunction *caller = nullptr;  // Null if this is the call to __top_level_expression
+    DispatchEntry *de = nullptr;    // Null if static call.
+};
+
 struct Overload {
     SubFunction *sf = nullptr;
     vector<TypeRef> givenargs;
@@ -437,6 +443,7 @@ struct SubFunction {
     bool optimized = false;
     bool explicit_generics = false;
     int returned_thru_to_max = -1;  // >=0: there exist return statements that may skip the caller.
+    vector<int> returned_thru_function_ids;
     UDT *method_of = nullptr;
     int numcallers = 0;
     Type thistype { V_FUNCTION, this };  // convenient place to store the type corresponding to this
@@ -445,6 +452,7 @@ struct SubFunction {
     Overload *lexical_parent = nullptr;
     Overload *overload = nullptr;
     size_t node_count = 0;
+    vector<Caller> callers;
 
     SubFunction(int _idx) : idx(_idx) {}
 
@@ -903,6 +911,17 @@ struct SymbolTable {
         }
         auto uit = gudts.find(name);
         if (uit != gudts.end()) return uit->second;
+        return nullptr;
+    }
+    GUDT *LookupStructQuery(string_view name) {
+        GUDT* res = LookupStruct(name);
+        if(res) return res;
+        //Try to search out of scope when doing query
+        for (auto gudt = gudttable.rbegin(); gudt != gudttable.rend(); ++gudt) {
+            if((*gudt)->name == name) {
+                return *gudt;
+            }
+        }
         return nullptr;
     }
 

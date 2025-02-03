@@ -239,6 +239,13 @@ def treenode(label, body):
         treenode_end()
     return open
 
+def treenode(label, flags, body):
+    let open = treenode_start(label, flags)
+    if open:
+        body()
+        treenode_end()
+    return open
+
 def treenode_open(label, body):
     let open = treenode_start(label, treenode_default_open)
     if open:
@@ -336,6 +343,14 @@ def popup(label, body):
 // Call this right after any item for which you want RMB to generate a popup.
 def popup_rmb_prev_item(label, body):
     let open = popup_start(label, 0, true)
+    if open:
+        body()
+        popup_end()
+    return open
+
+// Call im.popup_modal_open (from e.g. im.button) with same label as this, followed by im.popup_modal() with body.
+def popup_modal(label, flags, body):
+    let open = popup_modal_start(label, flags)
     if open:
         body()
         popup_end()

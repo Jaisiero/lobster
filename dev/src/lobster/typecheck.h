@@ -486,6 +486,21 @@ struct TypeChecker {
                 if (!sf->sbody) sf = CloneFunction(*sf->parent->overloads[0]);
                 TypeCheckFunctionDef(*sf, *sf->sbody);
             }
+            /*
+            if (bound->sf && bound->sf->parent->istype) {
+                // FIXME: this doesn't work, as we have plenty of use cases where a function type is
+                // used in a non-escaping way which works fine with free variables.
+                // We'd need to detect the common case of function types attached to chained function args
+                // whose only use is a dyncall way down the line.
+                for (auto &fv : sf->freevars) {
+                    // Allow globals.
+                    if (fv.sid->id->scopelevel == 1) continue;
+                    Error(*a, cat("cannot pass function value with free variable ",
+                                  Q(fv.sid->id->name), " to declared function type ",
+                                  Q(bound->sf->parent->name)));
+                }
+            }
+            */
             // Covariant again.
             if (sf->returntype->NumValues() != returntype->NumValues() ||
                 !ConvertsTo(sf->returntype, returntype, CF_UNIFICATION))
@@ -943,6 +958,8 @@ struct TypeChecker {
                                         sf.returntype->tup->begin() + sf.reqret);
                         sf.returntype = nt;
                     }
+                } else if (len < sf.reqret) {
+                    Error(call_context, cat("returning ", len, " values, caller requires ", sf.reqret));
                 }
             }
         } else {
@@ -1058,25 +1075,20 @@ struct TypeChecker {
         return true;
     }
 
-    void CheckReturnPast(SubFunction *sf, const SubFunction *sf_to, const Node &context) {
-        // Special case for returning out of top level, which is always allowed.
-        if (sf_to != st.toplevel) {
-            if (sf->isdynamicfunctionvalue) {
-                // This is because the function has been typechecked against one context, but
-                // can be called again in a different context that does not have the same callers.
-                Error(context, "cannot return through dynamic function value (",
-                      "return statement tries to return from ", Q(sf_to->parent->name), ")");
-            }
-        }
-        auto nretslots = ValWidthMulti(sf_to->returntype, sf_to->returntype->NumValues());
-        sf->returned_thru_to_max = std::max(sf->returned_thru_to_max, nretslots);
-    }
-
     TypeRef TypeCheckMatchingCall(SubFunction *sf, List &call_args, bool static_dispatch,
-                                  bool first_dynamic, bool may_have_lambda_args) {
+                                  bool first_dynamic, bool may_have_lambda_args,
+                                  DispatchEntry *de) {
         STACK_PROFILE;
         // Here we have a SubFunction witch matching specialized types.
         sf->numcallers++;
+        auto parent_sf = scopes.empty() ? nullptr : scopes.back().sf;
+        for (auto &caller : sf->callers) {
+            if (caller.caller == parent_sf && caller.de == de) {
+                goto existing_caller;
+            }
+        }
+        sf->callers.push_back(Caller{ parent_sf, de });
+        existing_caller:
         Function &f = *sf->parent;
         if (may_have_lambda_args && (static_dispatch || first_dynamic)) {
             for (auto [i, c] : enumerate(call_args.children)) {
@@ -1117,12 +1129,15 @@ struct TypeChecker {
             freevar.type = freevar.sid->Current()->type;
         }
         // See if this call is recursive:
-        for (auto &sc : scopes) if (sc.sf == sf) {
-            sf->isrecursivelycalled = true;
-            if (sf->returngiventype.Null())
-                Error(call_args, "recursive function ", Q(sf->parent->name),
-                                 " must have explicit return type");
-            break;
+        for (auto &sc : scopes) {
+            if (sc.sf == sf) {
+                sf->isrecursivelycalled = true;
+                if (sf->returngiventype.Null())
+                    Error(call_args, "recursive function ", Q(sf->parent->name),
+                          " must have explicit return type");
+
+                break;
+            }
         }
         return sf->returntype;
     };
@@ -1151,7 +1166,6 @@ struct TypeChecker {
                         "reused return value");
                     goto destination_found;
                 }
-                CheckReturnPast(isc.sf, isf, call_context);
             }
             // This error should hopefully be rare, but still possible if this call is in
             // a very different context.
@@ -1159,7 +1173,70 @@ struct TypeChecker {
                                 " can\'t find destination ", Q(isf->parent->name));
             destination_found:;
         }
+        vector<SubFunction *> rec_sfs;
+        for (auto [isf, type] : sf->reuse_return_events) {
+            auto start_sf = scopes.back().sf;
+            auto nretslots = ValWidthMulti(isf->returntype, isf->returntype->NumValues());
+            if (!RecursiveCheckReturns(start_sf, nretslots, isf, rec_sfs, call_context))
+                Error(call_context, "return from ", Q(isf->parent->name), " called out of context");
+            assert(rec_sfs.empty());
+        }
     };
+
+    // This more complex iteration is needed for recursion, see below in Return::TypeCheck
+    // and TypeCheckCallStatic
+    bool RecursiveCheckReturns(SubFunction *sf, int nretslots,
+                               const SubFunction *dest_sf, vector<SubFunction *>rec_dest_sf,
+                               const Node &context) {
+        if (sf->parent == dest_sf->parent) {
+            // Reached destination for this particular trace.
+            return true;
+        }
+        // Special case for returning out of top level, which is always allowed.
+        if (dest_sf != st.toplevel && sf->isdynamicfunctionvalue) {
+            // This is because the function has been typechecked against one context, but
+            // can be called again in a different context that does not have the same
+            // callers.
+            Error(context, "cannot return through dynamic function value (",
+                    "return statement tries to return from ", Q(dest_sf->parent->name), ")");
+        }
+        if (sf->returned_thru_to_max >= nretslots) {
+            // We already have something returning thru here that is at least as big, check if
+            // its the same function because then we're done.
+            // This is not only a huge early-out optimization, it also prevents recursive calls
+            // from stack overflowing this function :)
+            for (auto idx : sf->returned_thru_function_ids) {
+                if (idx == dest_sf->parent->idx) {
+                    return true;
+                }
+            }
+        }
+        sf->returned_thru_to_max = std::max(sf->returned_thru_to_max, nretslots);
+        sf->returned_thru_function_ids.push_back(dest_sf->parent->idx);
+        // Now we step into the callers. This will typically only have 1 element in it in the
+        // non-recursive case, and 2 for a normal active recursive call.
+        for (auto &caller : sf->callers) {
+            if (!caller.caller) {
+                return false;  // Arrived at root call.
+            }
+            if (caller.de) {
+                caller.de->returned_thru_to_max =
+                    std::max(caller.de->returned_thru_to_max, nretslots);
+                for (auto udt : caller.de->dispatch_root->subudts) {
+                    // If any SubFunction in the dispatch generates an unwind check, all of them
+                    // must return assuming one.
+                    auto dsf = udt->dispatch_table[caller.de->vtable_idx]->sf;
+                    if (!dsf) continue;
+                    dsf->returned_thru_to_max = std::max(dsf->returned_thru_to_max, nretslots);
+                }
+            }
+            if (!RecursiveCheckReturns(caller.caller, nretslots, dest_sf, rec_dest_sf, context))
+                return false;
+        }
+        return true;
+    }
+
+
 
     void UnWrapBoth(TypeRef &otype, TypeRef &atype) {
         while (otype->Wrapped() && otype->t == atype->t) {
@@ -1196,7 +1273,7 @@ struct TypeChecker {
 
     TypeRef TypeCheckCallStatic(SubFunction *&sf, List &call_args, size_t reqret,
                                 vector<TypeRef> *specializers, Overload &ov,
-                                bool static_dispatch, bool first_dynamic, bool force_keep) {
+                                bool static_dispatch, bool first_dynamic, bool force_keep, DispatchEntry *de) {
         STACK_PROFILE;
         Function &f = *sf->parent;
         if (ov.isprivate && ov.declared_at.fileidx != call_args.line.fileidx)
@@ -1278,11 +1355,22 @@ struct TypeChecker {
                     // Make sure to add any freevars this call caused to be
                     // added to its parents also to the current parents, just in case
                     // they're different.
+                    // FIXME: this code trying to re-apply effects is not great, as it doesn't work
+                    // with recursive functions: at this point where we are re-using a recursive
+                    // call, the original call is still half-way being typechecked, so not all
+                    // returns have been processed. This can be seen in
+                    // tests\errors\recursive_non_local_return.lobster
+                    // Where the recursive call to frecur is reused before that function is
+                    // marked as having non-local returns, resulting in missing unwinding code.
+                    // For that particular problem we fix this by tracker "Caller" per function,
+                    // such that when the non-local return happens it knows about all active callers,
+                    // not just the current one, see Return::TypeCheck.
+                    // But some of the other code below may need similar treatment.
                     LOG_DEBUG("re-using: ", Signature(*sf));
                     CheckFreeVariablesFromFunction(sf);
                     ReplayReturns(sf, call_args);
                     auto rtype = TypeCheckMatchingCall(sf, call_args, static_dispatch,
-                                                       first_dynamic, has_lambda_args);
+                                                       first_dynamic, has_lambda_args, de);
                     if (!sf->isrecursivelycalled) ReplayAssigns(sf);
                     return rtype;
                 }
@@ -1314,7 +1402,7 @@ struct TypeChecker {
         assert(!sf->freevars.size());
         LOG_DEBUG("specialization: ", Signature(*sf));
         auto rtype =
-            TypeCheckMatchingCall(sf, call_args, static_dispatch, first_dynamic, has_lambda_args);
+            TypeCheckMatchingCall(sf, call_args, static_dispatch, first_dynamic, has_lambda_args, de);
         if (udt) {
             st.PopSuperGenerics(udt);
         }
@@ -1335,28 +1423,28 @@ struct TypeChecker {
             // FIXME: does this guarantee it find it in the recursive case?
             // TODO: we chould check for a superclass vtable entry also, but chances
             // two levels will be present are low.
-            if (disp.sf && disp.sf->method_of == &dispatch_udt && disp.is_dispatch_root &&
-                !disp.is_switch_dispatch && &f == disp.sf->parent) {
+            if (disp->sf && disp->sf->method_of == &dispatch_udt && disp->dispatch_root &&
+                !disp->is_switch_dispatch && &f == disp->sf->parent) {
                 for (auto [i, c] : enumerate(call_args.children)) {
-                    auto &arg = disp.sf->args[i];
+                    auto &arg = disp->sf->args[i];
                     if (i && !ConvertsTo(c->exptype, arg.type, CF_NONE))
                         goto fail;
                 }
                 // If this ever fails, that means new types got added during typechecking..
                 // which means we'd just have to create a new vtable entry instead, or somehow
                 // avoid the new type.
-                assert(disp.subudts_size == dispatch_udt.subudts.size());
+                assert(disp->subudts_size == dispatch_udt.subudts.size());
                 // We must check that ALL functions involved are compatible, since some
                 // may touch different freevars that the dispatch root doesn't have, such that
                 // if they were different means we can't reuse this dispatch.
                 for (auto udt : dispatch_udt.subudts) {
-                    auto sf = udt->dispatch_table[i].sf;
+                    auto sf = udt->dispatch_table[i]->sf;
                     if (!SpecializationIsCompatible(*sf, reqret))
                         goto fail;
                 }
                 // We can reuse!
                 for (auto udt : dispatch_udt.subudts) {
-                    auto sf = udt->dispatch_table[i].sf;
+                    auto sf = udt->dispatch_table[i]->sf;
                     LOG_DEBUG("re-using dyndispatch: ", Signature(*sf));
                     if (sf->typechecked) {
                         // If sf is not typechecked here, it means a function before this in
@@ -1367,9 +1455,9 @@ struct TypeChecker {
                     }
                 }
                 // Type check this as if it is a static dispatch to just the root function.
-                TypeCheckMatchingCall(csf = disp.sf, call_args, true, false, true);
+                TypeCheckMatchingCall(csf = disp->sf, call_args, true, false, true, disp.get());
                 vtable_idx = (int)i;
-                return dispatch_udt.dispatch_table[i].returntype;
+                return disp->returntype;
             }
             fail:;
         }
@@ -1421,10 +1509,10 @@ struct TypeChecker {
                 assert((int)dt.size() <= vtable_idx);  // Double entry.
                 // FIXME: this is not great, wasting space, but only way to do this
                 // on the fly without tracking lots of things.
-                while ((int)dt.size() < vtable_idx) dt.push_back({});
-                dt.push_back({ !overload_picks[i].ov
-                                ? nullptr
-                                : overload_picks[i].ov->sf });
+                while ((int)dt.size() < vtable_idx)
+                    dt.push_back(make_unique<DispatchEntry>(DispatchEntry{}));
+                dt.push_back(make_unique<DispatchEntry>(
+                    DispatchEntry{ !overload_picks[i].ov ? nullptr : overload_picks[i].ov->sf }));
             }
             // We are now going to type check all functions in the vtable for the given
             // call_args, which normally determines the lifetimes of the function args.
@@ -1437,16 +1525,16 @@ struct TypeChecker {
             // issues finding an existing dispatch above? would be good to guarantee..
             // The fact that in subudts the superclass comes first will help avoid problems
             // in many cases.
-            auto de = &dispatch_udt.dispatch_table[vtable_idx];
-            de->is_dispatch_root = true;
+            auto de = dispatch_udt.dispatch_table[vtable_idx].get();
+            de->dispatch_root = &dispatch_udt;
             de->returntype = st.NewTypeVar();
             de->subudts_size = dispatch_udt.subudts.size();
+            de->vtable_idx = vtable_idx;
             // Typecheck all the individual functions.
             SubFunction *last_sf = nullptr;
             bool any_recursive = false;
-            int any_returned_thru_max = -1;
             for (auto [i, udt] : enumerate(dispatch_udt.subudts)) {
-                auto sf = udt->dispatch_table[vtable_idx].sf;
+                auto sf = udt->dispatch_table[vtable_idx]->sf;
                 // Missing implementation for unused UDT.
                 if (!sf)
                     continue;
@@ -1474,12 +1562,10 @@ struct TypeChecker {
                 // FIXME: return value?
                 /*auto rtype =*/
                 TypeCheckCallStatic(csf, call_args, reqret, specializers, *overload_picks[i].ov,
-                                    false, !last_sf, true);
-                de = &dispatch_udt.dispatch_table[vtable_idx];  // May have realloced.
+                                    false, !last_sf, true, de);
                 sf = csf;
-                udt->dispatch_table[vtable_idx].sf = sf;
+                udt->dispatch_table[vtable_idx]->sf = sf;
                 if (sf->isrecursivelycalled) any_recursive = true;
-                any_returned_thru_max = std::max(any_returned_thru_max, sf->returned_thru_to_max);
                 auto u = sf->returntype;
                 if (de->returntype->IsBoundVar()) {
                     // FIXME: can this still happen now that recursive cases use explicit return
@@ -1506,7 +1592,7 @@ struct TypeChecker {
             // Pass 2.
             last_sf = nullptr;
             for (auto [i, udt] : enumerate(dispatch_udt.subudts)) {
-                auto sf = udt->dispatch_table[vtable_idx].sf;
+                auto sf = udt->dispatch_table[vtable_idx]->sf;
                 if (!sf) continue;
                 if (any_recursive && sf->returngiventype.Null())
                     Error(call_args, "recursive dynamic dispatch of ", Q(sf->parent->name),
@@ -1516,8 +1602,8 @@ struct TypeChecker {
                     // in case the superclass picked a different one.
                     for (auto [j, pick] : enumerate(overload_picks)) {
                         if (!pick.supcall && pick.ov == overload_picks[i].ov) {
-                            udt->dispatch_table[vtable_idx].sf =
-                                dispatch_udt.subudts[j]->dispatch_table[vtable_idx].sf;
+                            udt->dispatch_table[vtable_idx]->sf =
+                                dispatch_udt.subudts[j]->dispatch_table[vtable_idx]->sf;
                             break;
                         }
                     }
@@ -1536,16 +1622,10 @@ struct TypeChecker {
                     }
                 }
                 last_sf = sf;
-                // Even if this sf is not returned thru, there may be an unwind check due to other
-                // sfs in the dispatch.
-                sf->returned_thru_to_max = std::max(sf->returned_thru_to_max, any_returned_thru_max);
             }
-            dispatch_udt.dispatch_table[vtable_idx].returned_thru_to_max =
-                std::max(dispatch_udt.dispatch_table[vtable_idx].returned_thru_to_max,
-                         any_returned_thru_max);
             call_args.children[0]->exptype = &dispatch_udt.thistype;
         }
-        return dispatch_udt.dispatch_table[vtable_idx].returntype;
+        return dispatch_udt.dispatch_table[vtable_idx]->returntype;
     };
 
     // Reuse these, otherwise cause a LOT of allocations.
@@ -1603,7 +1683,7 @@ struct TypeChecker {
                 pickfrom.clear();
                 matches.clear();
                 return TypeCheckCallStatic(csf, call_args, reqret, specializers, *pick, true,
-                                           false, false);
+                                           false, false, nullptr);
             }
             if ((int)f.nargs() == argidx) {
                 // Gotten to the end and we still have multiple matches!
@@ -1784,7 +1864,7 @@ struct TypeChecker {
         if (sf->parent->istype) {
             // Function types are always fully typed.
             // All calls thru this type must have same lifetimes, so we fix it to LT_BORROW.
-            dc->exptype = TypeCheckMatchingCall(sf, *dc, true, false, true);
+            dc->exptype = TypeCheckMatchingCall(sf, *dc, true, false, true, nullptr);
             dc->lt = sf->ltret;
             dc->sf = sf;
             return dc;
@@ -1793,7 +1873,7 @@ struct TypeChecker {
             c->children.append(dc->children.data(), dc->children.size());
             dc->children.clear();
             c->exptype =
-                TypeCheckCallStatic(sf, *c, reqret, nullptr, *sf->parent->overloads[0], true, false, false);
+                TypeCheckCallStatic(sf, *c, reqret, nullptr, *sf->parent->overloads[0], true, false, false, nullptr);
             c->lt = sf->ltret;
             c->sf = sf;
             delete dc;
@@ -2260,7 +2340,12 @@ struct TypeChecker {
         // Check if we need to do any lifetime adjustments.
         AdjustLifetime(n, recip, idents);
         // Check for queries.
-        if (query && query->qloc == n->line) ProcessQuery();
+        if (query) {
+            if ((reqret==0 && n->line == query->qloc) //reqret usually in the end of line
+             || (n->line.line > query->qloc.line && n->line.fileidx==query->qloc.fileidx)) { //If above missed
+                ProcessQuery();
+            }
+        }
     }
 
     // TODO: Can't do this transform ahead of time, since it often depends upon the input args.
@@ -2328,8 +2413,85 @@ struct TypeChecker {
             }
         }
     }
+    TypeRef FindVarType(string_view ident, SubFunction *sf) {
+        for (auto &vars : {sf->args, sf->locals, sf->freevars}) {
+            for (auto &var : vars) {
+                if (var.sid->id->name == ident && !var.sid->type.Null()) {
+                    return var.sid->type;
+                }
+            }
+        }
+        return TypeRef(nullptr);
+    }
 
-    void ProcessQuery() {
+    bool ProcessDefinition(GUDT *parent, string full_iden, SubFunction **sf) {
+        size_t pos = full_iden.find('.');
+        bool got_pos = pos != std::string::npos;
+        string ident = full_iden;
+        if (got_pos) {
+            ident = full_iden.substr(0, pos);
+            //Possible a class or a struct name
+            auto ident_type = FindVarType(ident, *sf);
+            if (!ident_type.Null()) {
+                ident = TypeName(ident_type);
+            }
+        }
+        auto new_parent_struct = st.LookupStructQuery(ident);
+
+        if (new_parent_struct && !got_pos){ //Just class instance
+            LocationQuery(new_parent_struct->line, Signature(*new_parent_struct));
+        }
+
+        // FIXME: may not work when namespaces are involved.
+        auto f = st.FindFunction(full_iden);
+        if (f) {
+            auto ov = f->overloads[0];
+            if(parent) { //Try to find method of parent class with same name
+                for (auto &candidate_ov : f->overloads) {
+                    if (TypeName(candidate_ov->givenargs[0]) == parent->name) {
+                        ov = candidate_ov;
+                        break;
+                    }
+                }
+            }
+            if (ov->gbody) {  // FIXME: ignores function types. Now fixed (or not?)
+                LocationQuery(ov->gbody->line, ov->sf ? Signature(*ov->sf) : "");
+            }
+        }
+        auto fld = st.FieldUse(full_iden);
+        if (fld && parent) {
+            // To know what this belongs to, would need to find the object it belongs to.
+            // For now, simply see if we can find any class that has this field.
+            int fi = parent->Has(fld);
+            if (fi >= 0) {
+                auto struct_type = st.LookupStructQuery(TypeName(parent->fields[fi].giventype));
+                if (got_pos) { //Go further with detected struct as a parent
+                    ProcessDefinition(struct_type, full_iden.substr(pos+1), sf);
+                }
+                LocationQuery(parent->fields[fi].defined_in, TypeName(parent->fields[fi].giventype));
+            }
+        }
+        auto nf = parser.natreg.FindNative(full_iden);
+        if (nf) {
+            // This doesn't have a source code location, so output a signature the IDE can display.
+            THROW_OR_ABORT("query_signature: " + Signature(*nf));
+        }
+        if (fld) { //Failed to find field in parent or no parent
+            for (auto gudt : st.gudttable) {
+                int fi = gudt->Has(fld);
+                if (fi >= 0) {
+                    // FIXME: this is really basic, lets at least find the field line.
+                    LocationQuery(gudt->line, TypeName(gudt->fields[fi].giventype));
+                }
+            }
+        }
+        if (got_pos) { //Go further
+            ProcessDefinition(new_parent_struct, full_iden.substr(pos+1), sf);
+        }
+        return false;
+    }
+
+    bool ProcessQuery() {
         if (query->kind == "definition") {
             // The top scope includes a list of free vars so should be able to resolve any var
             // at the given location.. if no scopes, use top fun.
@@ -2337,38 +2499,10 @@ struct TypeChecker {
             FindVar(sf->args);
             FindVar(sf->locals);
             FindVar(sf->freevars);
-            auto gudt = st.LookupStruct(query->iden);
-            if (gudt) {
-                LocationQuery(gudt->line, Signature(*gudt));
-            }
-            // FIXME: may not work when namespaces are involved.
-            auto f = st.FindFunction(query->iden);
-            if (f) {
-                auto ov = f->overloads[0];
-                if (ov->gbody) {  // FIXME: ignores function types.
-                    LocationQuery(ov->gbody->line, ov->sf ? Signature(*ov->sf) : "");  
-                }
-            }
-            auto nf = parser.natreg.FindNative(query->iden);
-            if (nf) {
-                // This doesn't have a source code location, so output a signature the IDE can display.
-                THROW_OR_ABORT("query_signature: " + Signature(*nf));
-            }
-            auto fld = st.FieldUse(query->iden);
-            if (fld) {
-                // To know what this belongs to, would need to find the object it belongs to.
-                // For now, simply see if we can find any class that has this field.
-                for (auto gudt : st.gudttable) {
-                    int fi = gudt->Has(fld);
-                    if (fi >= 0) {
-                        // FIXME: this is really basic, lets at least find the field line.
-                        LocationQuery(gudt->line, TypeName(gudt->fields[fi].giventype));
-                    }
-                }
-            }
-            THROW_OR_ABORT("query_unknown_ident: " + query->iden);
+            return ProcessDefinition(nullptr, query->iden, &sf);
         } else {
             THROW_OR_ABORT("query_unknown_kind: " + query->kind);
+            return false;
         }
     }
 
@@ -2691,13 +2825,14 @@ Node *Switch::TypeCheck(TypeChecker &tc, size_t reqret) {
             // FIXME: this is not great, wasting space, but only way to do this
             // on the fly without tracking lots of things.
             while ((int)dt.size() < vtable_idx)
-                dt.push_back({});
-            dt.push_back({ nullptr, case_picks[i], true });
+                dt.push_back(make_unique<DispatchEntry>(DispatchEntry {}));
+            dt.push_back(make_unique<DispatchEntry>(DispatchEntry{ nullptr, case_picks[i], true }));
         }
-        auto de = &dispatch_udt.dispatch_table[vtable_idx];
+        auto de = dispatch_udt.dispatch_table[vtable_idx].get();
         de->is_switch_dispatch = true;
-        de->is_dispatch_root = true;
+        de->dispatch_root = &dispatch_udt;
         de->subudts_size = dispatch_udt.subudts.size();
+        de->vtable_idx = vtable_idx;
     } else if (default_loc < 0) {
         if (ptype->IsEnum()) {
             for (auto [i, ev] : enumerate(ptype->e->vals)) {
@@ -3603,12 +3738,20 @@ Node *Return::TypeCheck(TypeChecker &tc, size_t /*reqret*/) {
     }
     // Now we can check what we're returning past as well.
     // Do this last, since we want RetVal to have been called on sf.
-    for (auto isc : reverse(tc.scopes)) {
-        if (isc.sf->parent == sf->parent) { goto destination_found; }
-        tc.CheckReturnPast(isc.sf, sf, *this);
-    }
-    tc.Error(*this, "return from ", Q(sf->parent->name), " called out of context");
-    destination_found:
+    // Previously, we would simply iterate over reverse(tc.scopes) to find all functions
+    // we are returning past, but that does not work with recursive functions.
+    // So now we have RecursiveCheckReturns which checks ALL active return paths from here,
+    // which in the case of a recursive function includes both the original entry point and
+    // the recursion point, both of which may have callers that need to be marked.
+    // Typically, in a non-recursive call situation, this recursive iteration will be equivalent
+    // to a simple reverse(tc.scopes), because this path will be the first in the call-graph.
+    // See example in tests\errors\recursive_non_local_return.lobster
+    // See also reuse code in TypeCheckCallStatic
+    auto start_sf = tc.scopes.back().sf;
+    auto nretslots = ValWidthMulti(sf->returntype, sf->returntype->NumValues());
+    vector<SubFunction *> rec_sfs;
+    if (!tc.RecursiveCheckReturns(start_sf, nretslots, sf, rec_sfs, *this))
+        tc.Error(*this, "return from ", Q(sf->parent->name), " called out of context");
     return this;
 }
 

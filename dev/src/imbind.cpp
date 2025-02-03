@@ -230,7 +230,14 @@ void NPop(VM &vm, Nesting n) {
 
 void IsInit(VM &vm, pair<Nesting, Nesting> require = { N_WIN, N_MENU }) {
     if (!imgui_init) vm.BuiltinError("imgui: not running: call im.init first");
-    for (auto n : nstack) if (n == require.first || n == require.second) return;
+    for (auto n : nstack) {
+        if (n == require.first || n == require.second) return;
+        // A popup is a window, so should N_POPUP should allow anything that requires N_WIN.
+        if (n == N_POPUP) {
+            n = N_WIN;
+            if (n == require.first || n == require.second) return;
+        }
+    }
     if (require.first != N_NONE || require.second != N_NONE) {
         vm.BuiltinError("imgui: invalid nesting (not inside im.window?)");
     }
@@ -1035,6 +1042,14 @@ nfr("is_item_deactivated_after_edit", "", "", "B",
         Push(sp, result);
     });
 
+nfr("is_item_focused", "", "", "B",
+    "returns true if the last item is focused",
+    [](StackPtr &sp, VM &vm) {
+        IsInit(vm);
+        auto result = ImGui::IsItemFocused();
+        Push(sp, result);
+    });
+
 nfr("want_capture_mouse", "", "", "B",
     "returns true if imgui wants to capture the mouse",
     [](StackPtr &sp, VM &vm) {
@@ -1419,6 +1434,14 @@ nfr("rect_filled", "min,max,color,rounding", "F}:2F}:2F}:4F", "",
         );
     });
 
+nfr("set_next_item_open", "is_open,cond", "BI", "", "Set the open state of the next treenode",
+    [](StackPtr &sp, VM &vm) {
+        IsInit(vm);
+        auto cond = Pop(sp).ival();
+        auto is_open = Pop(sp).True();
+        ImGui::SetNextItemOpen(is_open, (ImGuiCond)cond);
+    });
+
 nfr("treenode_start", "label,flags", "SI", "B",
     "(use im.treenode instead)",
     [](StackPtr &sp, VM &vm) {
@@ -1608,12 +1631,23 @@ nfr("group_end", "", "", "",
 nfr("popup_start", "label,winflags,rmbprevitem", "SIB?", "B",
     "(use im.popup instead)",
     [](StackPtr &sp, VM &vm) {
-        IsInit(vm);
+        IsInit(vm, { N_FRAME, N_NONE });
         auto rmb = Pop(sp).True();
         auto flags = (ImGuiWindowFlags)Pop(sp).intval();
         auto title = Pop(sp);
         bool open = rmb ? ImGui::BeginPopupContextItem(Label(vm, title))
             : ImGui::BeginPopup(Label(vm, title), flags);
+        Push(sp, open);
+        if (open) NPush(N_POPUP);
+    });
+
+nfr("popup_modal_start", "label,winflags", "SI", "B",
+    "(use im.popup_modal instead)",
+    [](StackPtr &sp, VM &vm) {
+        IsInit(vm, { N_FRAME, N_NONE });
+        auto flags = (ImGuiWindowFlags)Pop(sp).intval();
+        auto title = Pop(sp);
+        bool open = ImGui::BeginPopupModal(Label(vm, title), nullptr, flags);
         Push(sp, open);
         if (open) NPush(N_POPUP);
     });
@@ -1628,7 +1662,7 @@ nfr("popup_end", "", "", "",
 nfr("popup_open", "label", "S", "",
     "",
     [](StackPtr &sp, VM &vm) {
-        IsInit(vm);
+        IsInit(vm, { N_FRAME, N_NONE });
         auto title = Pop(sp);
         ImGui::OpenPopup(Label(vm, title));
     });
